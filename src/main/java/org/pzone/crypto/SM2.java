@@ -7,6 +7,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.io.UnsupportedEncodingException;
 import java.math.BigInteger;
 import java.security.SecureRandom;
@@ -554,8 +555,10 @@ public class SM2 {
 			r = e.add(x1);
 			r = r.mod(n);
 		} while (r.equals(BigInteger.ZERO) || r.add(k).equals(n));
+
 		BigInteger s = ((keyPair.getPrivateKey().add(BigInteger.ONE).modInverse(n))
 				.multiply((k.subtract(r.multiply(keyPair.getPrivateKey()))).mod(n))).mod(n);
+
 		return new Signature(r, s);
 	}
 
@@ -577,11 +580,14 @@ public class SM2 {
 			return false;
 		if (!between(signature.s, BigInteger.ONE, n))
 			return false;
+
 		byte[] M_ = join(ZA(IDA, aPublicKey), M.getBytes());
 		BigInteger e = new BigInteger(1, sm3hash(M_));
 		BigInteger t = signature.r.add(signature.s).mod(n);
+
 		if (t.equals(BigInteger.ZERO))
 			return false;
+
 		ECPoint p1 = G.multiply(signature.s).normalize();
 		ECPoint p2 = aPublicKey.multiply(t).normalize();
 		BigInteger x1 = p1.add(p2).normalize().getXCoord().toBigInteger();
@@ -621,6 +627,26 @@ public class SM2 {
 	}
 
 	/**
+	 * 传输实体类
+	 * 
+	 * @author Potato
+	 *
+	 */
+	private static class TransportEntity implements Serializable {
+		final byte[] R; //R点
+		final byte[] S; //验证S
+		final byte[] Z; //用户标识
+		final byte[] K; //公钥
+
+		public TransportEntity(byte[] r, byte[] s,byte[] z,ECPoint pKey) {
+			R = r;
+			S = s;
+			Z=z;
+			K=pKey.getEncoded(false);
+		}
+	}
+
+	/**
 	 * 密钥协商辅助类
 	 * 
 	 * @author Potato
@@ -629,11 +655,17 @@ public class SM2 {
 	public static class KeyExchange {
 		BigInteger rA;
 		ECPoint RA;
+		ECPoint V;
+		byte[] Z;
 		byte[] key;
+		
+		String ID;
 		SM2KeyPair keyPair;
 
-		public KeyExchange(SM2KeyPair keyPair) {
+		public KeyExchange(String ID,SM2KeyPair keyPair) {
+			this.ID=ID;
 			this.keyPair = keyPair;
+			this.Z=ZA(ID, keyPair.getPublicKey());
 		}
 
 		/**
@@ -641,79 +673,120 @@ public class SM2 {
 		 * 
 		 * @return
 		 */
-		public byte[] keyExchange_1() {
+		public TransportEntity keyExchange_1() {
 			rA = random(n);
 			// rA=new BigInteger("83A2C9C8 B96E5AF7 0BD480B4 72409A9A 327257F1
 			// EBB73F5B 073354B2 48668563".replace(" ", ""),16);
 			RA = G.multiply(rA).normalize();
-			return RA.getEncoded(false);
+			return new TransportEntity(RA.getEncoded(false), null,Z,keyPair.getPublicKey());
 		}
 
 		/**
 		 * 密钥协商响应方
 		 * 
-		 * @param IDA
-		 * @param IDB
-		 * @param aPublicKey
-		 * @param RAbytes
+		 * @param entity 传输实体
 		 * @return
 		 */
-		public byte[] keyExchange_2(String IDA, String IDB, ECPoint aPublicKey, byte[] RAbytes) {
+		public TransportEntity keyExchange_2(TransportEntity entity) {
 			BigInteger rB = random(n);
 			// BigInteger rB=new BigInteger("33FE2194 0342161C 55619C4A 0C060293
 			// D543C80A F19748CE 176D8347 7DE71C80".replace(" ", ""),16);
 			ECPoint RB = G.multiply(rB).normalize();
+			
+			this.rA=rB;
+			this.RA=RB;
 
 			BigInteger x2 = RB.getXCoord().toBigInteger();
 			x2 = _2w.add(x2.and(_2w.subtract(BigInteger.ONE)));
 
 			BigInteger tB = keyPair.getPrivateKey().add(x2.multiply(rB)).mod(n);
-			ECPoint RA = curve.decodePoint(RAbytes).normalize();
-
+			ECPoint RA = curve.decodePoint(entity.R).normalize();
+			
 			BigInteger x1 = RA.getXCoord().toBigInteger();
 			x1 = _2w.add(x1.and(_2w.subtract(BigInteger.ONE)));
 
+			ECPoint aPublicKey=curve.decodePoint(entity.K).normalize();
 			ECPoint temp = aPublicKey.add(RA.multiply(x1).normalize()).normalize();
 			ECPoint V = temp.multiply(ecc_bc_spec.getH().multiply(tB)).normalize();
 			if (V.isInfinity())
 				throw new IllegalStateException();
-
-			byte[] KB = KDF(join(V.getXCoord().toBigInteger().toByteArray(), V.getYCoord().toBigInteger().toByteArray(),
-					ZA(IDA, aPublicKey), ZA(IDB, keyPair.getPublicKey())), 16);
+			this.V=V;
+			
+			byte[] xV = V.getXCoord().toBigInteger().toByteArray();
+			byte[] yV = V.getYCoord().toBigInteger().toByteArray();
+			byte[] KB = KDF(join(xV, yV, entity.Z, this.Z), 16);
 			key = KB;
 			System.out.print("协商得B密钥:");
 			printHexString(KB);
-			return RB.getEncoded(false);
+			byte[] sB = sm3hash(new byte[] { 0x02 }, yV,
+					sm3hash(xV, entity.Z, this.Z, RA.getXCoord().toBigInteger().toByteArray(),
+							RA.getYCoord().toBigInteger().toByteArray(), RB.getXCoord().toBigInteger().toByteArray(),
+							RB.getYCoord().toBigInteger().toByteArray()));
+			return new TransportEntity(RB.getEncoded(false), sB,this.Z,keyPair.getPublicKey());
 		}
 
 		/**
 		 * 密钥协商发起方第二步
 		 * 
-		 * @param IDA
-		 * @param IDB
-		 * @param bPublicKey
-		 * @param RBbytes
+		 * @param entity 传输实体
 		 */
-		public void keyExchange_3(String IDA, String IDB, ECPoint bPublicKey, byte[] RBbytes) {
+		public TransportEntity keyExchange_3(TransportEntity entity) {
 			BigInteger x1 = RA.getXCoord().toBigInteger();
 			x1 = _2w.add(x1.and(_2w.subtract(BigInteger.ONE)));
-			
+
 			BigInteger tA = keyPair.getPrivateKey().add(x1.multiply(rA)).mod(n);
-			ECPoint RB = curve.decodePoint(RBbytes).normalize();
+			ECPoint RB = curve.decodePoint(entity.R).normalize();
 			
 			BigInteger x2 = RB.getXCoord().toBigInteger();
 			x2 = _2w.add(x2.and(_2w.subtract(BigInteger.ONE)));
-			
+
+			ECPoint bPublicKey=curve.decodePoint(entity.K).normalize();
 			ECPoint temp = bPublicKey.add(RB.multiply(x2).normalize()).normalize();
 			ECPoint U = temp.multiply(ecc_bc_spec.getH().multiply(tA)).normalize();
 			if (U.isInfinity())
 				throw new IllegalStateException();
+			this.V=U;
 			
-			byte[] KA = KDF(join(U.getXCoord().toBigInteger().toByteArray(), U.getYCoord().toBigInteger().toByteArray(),
-					ZA(IDA, keyPair.getPublicKey()), ZA(IDB, bPublicKey)), 16);
+			byte[] xU = U.getXCoord().toBigInteger().toByteArray();
+			byte[] yU = U.getYCoord().toBigInteger().toByteArray();
+			byte[] KA = KDF(join(xU, yU,
+					this.Z, entity.Z), 16);
 			key = KA;
 			System.out.print("协商得A密钥:");
 			printHexString(KA);
+			byte[] s1= sm3hash(new byte[] { 0x02 }, yU,
+					sm3hash(xU, this.Z, entity.Z, RA.getXCoord().toBigInteger().toByteArray(),
+							RA.getYCoord().toBigInteger().toByteArray(), RB.getXCoord().toBigInteger().toByteArray(),
+							RB.getYCoord().toBigInteger().toByteArray()));
+			if(Arrays.equals(entity.S, s1))
+				System.out.println("B->A 密钥确认成功");
+			else
+				System.out.println("B->A 密钥确认失败");
+			byte[] sA= sm3hash(new byte[] { 0x03 }, yU,
+					sm3hash(xU, this.Z, entity.Z, RA.getXCoord().toBigInteger().toByteArray(),
+							RA.getYCoord().toBigInteger().toByteArray(), RB.getXCoord().toBigInteger().toByteArray(),
+							RB.getYCoord().toBigInteger().toByteArray()));
+			
+			return new TransportEntity(RA.getEncoded(false), sA,this.Z,keyPair.getPublicKey());
+		}
+		
+		/**
+		 * 密钥确认最后一步
+		 * 
+		 * @param entity 传输实体
+		 */
+		public void keyExchange_4(TransportEntity entity) {
+			byte[] xV = V.getXCoord().toBigInteger().toByteArray();
+			byte[] yV = V.getYCoord().toBigInteger().toByteArray();
+			ECPoint RA = curve.decodePoint(entity.R).normalize();
+			byte[] s2= sm3hash(new byte[] { 0x03 }, yV,
+					sm3hash(xV, entity.Z, this.Z, RA.getXCoord().toBigInteger().toByteArray(),
+							RA.getYCoord().toBigInteger().toByteArray(), this.RA.getXCoord().toBigInteger().toByteArray(),
+							this.RA.getYCoord().toBigInteger().toByteArray()));
+			if(Arrays.equals(entity.S, s2))
+				System.out.println("A->B 密钥确认成功");
+			else
+				System.out.println("A->B 密钥确认失败");
 		}
 	}
 
@@ -757,14 +830,15 @@ public class SM2 {
 		System.out.println("-----------------密钥协商-----------------");
 		String aID = "AAAAAAAAAAAAA";
 		SM2KeyPair aKeyPair = sm02.generateKeyPair();
-		KeyExchange aKeyExchange = new KeyExchange(aKeyPair);
+		KeyExchange aKeyExchange = new KeyExchange(aID,aKeyPair);
 
 		String bID = "BBBBBBBBBBBBB";
 		SM2KeyPair bKeyPair = sm02.generateKeyPair();
-		KeyExchange bKeyExchange = new KeyExchange(bKeyPair);
-		byte[] RAbytes = aKeyExchange.keyExchange_1();
-		byte[] RBbytes = bKeyExchange.keyExchange_2(aID, bID, aKeyPair.getPublicKey(), RAbytes);
-		aKeyExchange.keyExchange_3(aID, bID, bKeyPair.getPublicKey(), RBbytes);
+		KeyExchange bKeyExchange = new KeyExchange(bID,bKeyPair);
+		TransportEntity entity1 = aKeyExchange.keyExchange_1();
+		TransportEntity entity2 = bKeyExchange.keyExchange_2(entity1);
+		TransportEntity entity3 = aKeyExchange.keyExchange_3(entity2);
+		bKeyExchange.keyExchange_4(entity3);
 	}
 
 	public static class Signature {
